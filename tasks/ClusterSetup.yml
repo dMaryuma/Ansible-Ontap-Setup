@@ -1,0 +1,86 @@
+---
+- hosts: localhost
+  gather_facts: false
+  collections:
+    - netapp.ontap
+  vars_files: "{{ file }}"
+  vars:
+    login: &login
+      username: "{{ username }}"
+      password: "{{ password }}"
+      https: true
+      validate_certs: false
+  name: "Build cluster: {{ cluster_name }}"
+
+  tasks:
+  - name: create cluster
+    na_ontap_cluster:
+      state: present
+      cluster_name: "{{ cluster_name }}"
+      hostname: "{{ hosts['node1'].mgmt_ip }}"
+      node_name: "{{ hosts['node1'].name }}"
+      use_rest: "Always"
+      <<: *login
+
+  - name: Create Private cluster lif for node2
+    ignore_errors: yes
+    na_ontap_interface:
+      state: present
+      interface_name: "clus3"
+      vserver: "Cluster"
+      address: "{{ hosts['node2'].cluster.private_ip }}"
+      netmask: "{{ hosts['node2'].cluster.netmask }}"
+      role: cluster
+      home_node: "localhost"
+      home_port: "{{ hosts['node2'].cluster.home_port }}"
+      hostname: "{{ hosts['node2'].mgmt_ip }}"
+      <<: *login
+
+  - name: Limit Info Gathering to Interface Information
+    na_ontap_info:
+      state: info
+      hostname: "{{ hosts['node1'].mgmt_ip }}"
+      gather_subset: "net_interface_info"
+      use_rest: "Always"
+      <<: *login
+    register: ontap_info_net
+    tags:
+    - debug
+
+  - name: "Join Node to {{ cluster_name }}"
+    na_ontap_cluster:
+      state: present
+      cluster_ip_address:  "{{ hosts['node2'].cluster.private_ip }}"
+      node_name: "{{ hosts['node2'].name }}"
+      hostname: "{{ hosts['node1'].mgmt_ip }}"
+      <<: *login
+
+  - name: Create cluster mgmt lif
+    na_ontap_interface:
+      state: present
+      interface_name: "{{ cluster_name }}_mgmt"
+      vserver: "{{ cluster_name }}"
+      address: "{{ hostname }}"
+      netmask: "{{ netmask }}"
+      role: cluster-mgmt
+      home_node: "{{ hosts['node1'].name }}"
+      home_port: e0M
+      hostname: "{{ hosts['node1'].ip }}"
+      <<: *login
+    tags:
+      - debug
+
+  - name: Add applications to admin user 
+    na_ontap_user:
+      state: present
+      name: admin
+      applications: ssh,console,http,ontapi,service-processor
+      authentication_method: password
+      role_name: admin
+      vserver: "{{ cluster_name }}"
+      hostname: "{{ cluster_ip }}"
+      <<: *login
+
+- name: import playbook
+  import_playbook: ConfigCluster.yml
+
