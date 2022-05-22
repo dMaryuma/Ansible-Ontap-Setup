@@ -191,8 +191,8 @@
       - policy
 
   - name: Remove Ports from Default Broadcast Domain
+    ignore_errors: yes
     na_ontap_broadcast_domain_ports:
-      ignore_errors: yes
       state: absent
       broadcast_domain: "Default"
       ports: "{{ item.node }}:{{ item.port }}"
