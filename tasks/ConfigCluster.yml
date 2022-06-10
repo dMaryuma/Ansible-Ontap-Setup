@@ -11,47 +11,41 @@
       password: "{{ password }}"
       https: true
       validate_certs: false
+  vars_prompt:
+    - name: isShelfPoweredOn
+      prompt: "Is NL-SAS Shelf Powered On?"
+      private: no
+      default: no
   name: "Build Configurations: {{ cluster_name }}"
 
   tasks:
-  - name: "Enable HA status for cluster"
-    na_ontap_cluster_ha:
-      state: present
-      <<: *login
-
-  - name: Set Login Message
-    na_ontap_command:
-      command: ["security login banner modify -vserver {{ cluster_name }} -message {{ motd }}"]
-      <<: *login
-    when: motd != None
-    
-  - name: Add licenses
-    na_ontap_license:
-      state: present
-      license_codes: "{{ licenses |list }}"
-      <<: *login
-
-  - name: Zero Spares and Enable Auto-Assign
-    na_ontap_command:
-      command: ['set d -c off;  disk option modify -node ',"{{ hosts['node1'].name }}",' -autoassign on;disk option modify -node ',"{{ hosts['node2'].name }}",' -autoassign on; disk zerospares']
-      <<: *login
-
-  - name: Modify Service Processor Network
-    na_ontap_service_processor_network:
+  - name: Checking is NL-SAS is Connected
+    debug:
+      msg: "NL-SAS is Connected, Continuing..."
+    when: isShelfPoweredOn == 'yes'
+  
+  - name: Assign FSAS Disks
+    na_ontap_disks:
       node: "{{ item.node }}"
-      dhcp: none
-      is_enabled: true
-      address_type: ipv4
-      state: present
-      ip_address: "{{ item.ip_address }}"
-      gateway_ip_address: "{{ item.gateway }}"
-      netmask: "{{ item.netmask }}"
+      disk_count: "{{ item.disk_count }}"
+      disk_type: "{{ item.disk_type }}"
+      min_spares: "{{ item.min_spares }}"
       <<: *login
     with_items:
-      "{{ sp }}"
-    when: sp != None
+      "{{ diskassign }}"
+    when: (diskassign != None) and (item.disk_type != 'SSD')
 
-  - name: Create Aggregates
+
+  - name: Assign StoragePool Disks
+    na_ontap_disks:
+      node: "{{ item.node }}"
+      <<: *login
+    with_items:
+      "{{ diskassign }}"
+    when: (diskassign != None) and (item.disk_type == 'SSD')
+
+
+  - name: Create FSAS Aggregates
     na_ontap_aggregate:
       state: present
       service_state: online
@@ -59,20 +53,28 @@
       disk_count: "{{ item.diskcount }} "
       disk_type: "{{ item.disktype }}"
       raid_size: "{{ item.raidsize }}"
+      wait_for_online: true
       raid_type: "{{ item.raidtype }}"
       nodes: "{{ item.node }}"
       <<: *login
     with_items:
       "{{ aggregates }}"
-    when: aggregates != None
+    when: (aggregates != None) and (item.disktype == 'FSAS')
+    
 
+ 
+ 
   - name: Apply hybrid mode for Aggregates
     na_ontap_command:
       command: ["aggr modify -aggregate {{ item.name }} -hybrid-enabled {{ item.hybrid }}"]
       <<: *login
     with_items:
       "{{ aggregates }}"
-    when: aggregates != None
+    when: (aggregates != None) and (item.hybrid == true)
+    
+    
+    
+
 
   - name: Create Storage Pool
     na_ontap_command:
@@ -81,25 +83,36 @@
     with_items:
       "{{ storagepool }}"
     when: storagepool != None
+    register: storage_pool_output
+    
 
+  
   - name: Add Storage Pool to Aggregate
     na_ontap_command:
-      command: ["aggr add-disks -storage-pool sp1 -aggregate {{ item.name }} -allocation-units {{ item.allocationunits }} -raidtype {{ item.sp_raid }}"]
+      command: ["aggr add-disks -storage-pool {{ item.sp }} -aggregate {{ item.name }} -allocation-units {{ item.allocationunits }}"]
       <<: *login
     with_items:
       "{{ aggregates }}"
-    when: (aggregates != None) and (item.allocationunits != None)
+    when: (aggregates != None) and (item.hybrid == true)
+    loop_control:
+      pause: 60
+    
 
+  - name: Enable Auto-Assign
+    na_ontap_command:
+      command: ['disk option modify -node * -autoassign on']
+      <<: *login
+  
   - name: Create Vserver
     na_ontap_svm:
       state: present
       name: "{{ item.name }}"
       allowed_protocols: "{{ item.protocols }}"    
+      aggr_list: "{{item.aggr_list | default(omit)}}"
       <<: *login
     with_items:
       "{{ vservers }}"
     when: vservers != None
-    tags: vserver
 
   - name: Create iscsi service
     netapp.ontap.na_ontap_iscsi:
@@ -107,6 +120,9 @@
       service_state: started
       vserver: "{{ item.vserver }}"
       <<: *login
+    with_items:
+      "{{ iscsi }}"
+    when: iscsi != None
 
   - name: Create and Configure NFS server
     na_ontap_nfs:
@@ -122,40 +138,13 @@
       "{{ nfs }}"
     when: nfs != None
 
-  - name: Create CIFS server - Active Directory
-    ignore_errors: yes
-    na_ontap_cifs_server:
-      state: present
-      cifs_server_name: "{{ item.cifs_server_name}}"
-      admin_user_name: "{{ item.admin_user }}"
-      admin_password: "{{ item.admin_password }}"
-      vserver: "{{ item.vserver }}"
-      domain: "{{ item.domain }}"
-      <<: *login
-    with_items:
-      "{{ cifsad }}"
-    when: cifsad != None
-
-  - name: Create CIFS share
-    na_ontap_cifs:
-      state: present
-      share_name: "{{ item.share_name }}"
-      path: "{{ item.vol_path }}"
-      vserver: "{{ item.vserver }}"
-      share_properties: browsable,oplocks
-      symlink_properties: read_only,enable
-      <<: *login
-    with_items:
-      "{{ cifsShares }}"
-    when: cifsShares != None
-
   - name: Create Login Users and Unlock Vsadmin
     na_ontap_user:
       state: present
       name: "{{ item.username }}" 
+      set_password: "{{ item.password }}"
       applications: "{{ item.apps }}"
       authentication_method: password
-      set_password: "{{ item.password }}"
       lock_user: false
       role_name: "{{ item.role }}"
       vserver: "{{ item.vserver }}"
@@ -163,18 +152,6 @@
     with_items:
       "{{ loginUsers }}"
     when: loginUsers != None
-    tags:
-      - vsadmin
-  - name: Set NTP Server
-    ignore_errors: yes
-    na_ontap_ntp:
-      state: present
-      server_name: "{{ item.server_name }}"
-      version: "{{ item.version }}"
-      <<: *login
-    with_items:
-      "{{ ntp }}"
-    when: ntp != None
 
   - name: Create Snapshot policy
     na_ontap_snapshot_policy:
@@ -187,8 +164,6 @@
     with_items:
       "{{ snapshot_policy }}"
     when: snapshot_policy != None
-    tags:
-      - policy
 
   - name: Remove Ports from Default Broadcast Domain
     ignore_errors: yes
@@ -199,32 +174,8 @@
       <<: *login
     with_items:
       "{{ ports }}"
-    when: ports != None
+    when: (ports != None )
 
-  - name: Modify Net Port
-    ignore_errors: yes
-    na_ontap_net_port:
-      state: present
-      node: "{{ item.node }}"
-      port: "{{ item.port }}"
-      mtu: "{{ item.mtu }}"
-      autonegotiate_admin: "{{ item.autonegotiate }}"
-      flowcontrol_admin: "{{ item.flowcontrol }}"
-      <<: *login
-    with_items:
-      "{{ ports }}"
-    when: ports != None
-
-  - name: Modify Net Port of ifgrp
-    na_ontap_net_port:
-      state: present
-      node: "{{ item.node }}"
-      port: "{{ item.name }}"
-      mtu: "{{ item.mtu }}"
-      <<: *login
-    with_items:
-      "{{ ifgrps }}"
-    when: ifgrps != None
 
   - name: Create ifgrp
     na_ontap_net_ifgrp:
@@ -239,16 +190,28 @@
       "{{ ifgrps }}"
     when: ifgrps != None
 
-  - name: Create VLAN
-    na_ontap_net_vlan:
+  - #name: Create VLAN
+    #na_ontap_net_vlan:
+      #state: present
+      #vlanid: "{{ item.vlanid }}"
+      #node: "{{ item.node }}"
+      #parent_interface: "{{ item.phy_interface }}"
+      #<<: *login
+    #with_items:
+      #"{{ vlans }}"
+    #when: vlans != None
+
+  - name: Split Mgmt broadcast domain
+    na_ontap_broadcast_domain:
       state: present
-      vlanid: "{{ item.vlanid }}"
-      node: "{{ item.node }}"
-      parent_interface: "{{ item.phy_interface }}"
+      from_name: "Default"
+      name: "MGMT"
+      ipspace: "Default"
       <<: *login
     with_items:
-      "{{ vlans }}"
-    when: vlans != None
+      "{{ ports }}"
+    when: (ports != None) and (item.port == 'e0M')
+
 
   - name: create broadcast domain
     na_ontap_broadcast_domain:
@@ -274,14 +237,33 @@
       admin_status: up
       address: "{{ item.address }}"
       netmask: "{{ item.netmask }}"
-      dns_domain_name: "{{ item.dns_domain_name |default}}"
+      dns_domain_name: "{{ item.dns_domain_name |default(omit)}}"
       vserver: "{{ item.vserver }}"
       <<: *login
     with_items:
       "{{ lifs }}"
     when: lifs != None
-    tags:
-      - lif
+
+
+  - name: Create SVM_MGMT Interface
+    na_ontap_interface:
+      state: present
+      interface_name: "{{ item.name }}"
+      home_port: "{{ item.port }}"
+      home_node: "{{ item.node }}"
+      admin_status: up
+      firewall_policy: mgmt
+      is_auto_revert: true
+      failover_scope: default
+      service_policy: default-management
+      interface_type: ip        
+      address: "{{ item.address }}"
+      netmask: "{{ item.netmask }}"
+      vserver: "{{ item.vserver }}"
+      <<: *login
+    with_items:
+      "{{ mgmt_lif }}"
+    when: mgmt_lif != None
 
   - name: Create Routes
     na_ontap_net_routes:
@@ -295,18 +277,55 @@
       "{{ routes }}"
     when: routes != None
 
+  - name: Set NTP Server
+    ignore_errors: yes
+    na_ontap_ntp:
+      state: present
+      server_name: "{{ item.server_name }}"
+      version: "{{ item.version }}"
+      <<: *login
+    with_items:
+      "{{ ntp }}"
+    when: ntp != None
+
   - name: Setup DNS
     na_ontap_dns:
       state: present
       vserver: "{{ item.vserver }}"
       domains: "{{ item.dns_domains }}"
       nameservers: "{{ item.dns_nameservers }}"
-      #ontapi: "{{ ontap_facts.ontap_version }}"
       skip_validation: "true"
       <<: *login
     with_items:
       "{{ dns }}"
     when: dns != None
+
+  #- name: Create CIFS server - Active Directory
+  #  ignore_errors: yes
+  #  na_ontap_cifs_server:
+  #    state: present
+  #    cifs_server_name: "{{ item.cifs_server_name}}"
+  #    admin_user_name: "{{ item.admin_user }}"
+  #    admin_password: "{{ item.admin_password }}"
+  #    vserver: "{{ item.vserver }}"
+  #    domain: "{{ item.domain }}"
+  #    <<: *login
+  #  with_items:
+  #    "{{ cifsad }}"
+  #  when: cifsad != None
+
+  #- name: Create CIFS share
+  #  na_ontap_cifs:
+  #    state: present
+  #    share_name: "{{ item.share_name }}"
+  #    path: "{{ item.vol_path }}"
+  #    vserver: "{{ item.vserver }}"
+  #    share_properties: browsable,oplocks
+  #    symlink_properties: read_only,enable
+  #    <<: *login
+  #  with_items:
+  #    "{{ cifsShares }}"
+  #  when: cifsShares != None
 
   - name: Modify Export Policy Default to 0.0.0.0/0
     na_ontap_export_policy_rule:
@@ -316,24 +335,35 @@
       policy_name: "default"
       protocol: "nfs"
       ro_rule: "any"
-      rw_rule: "None"
-      super_user_security: "None"
+      rw_rule: "any"
+      super_user_security: "sys"
       vserver: "{{ item.name }}"
       <<: *login
     with_items:
       "{{ vservers }}"
     when: vservers != None
 
+  - name: Create Export Policy For SVM2
+    na_ontap_export_policy:
+      state: present
+      name: "{{ item.name }}"
+      vserver: "{{ item.vserver }}"
+      <<: *login
+    with_items:
+      "{{ exportpolicy }}"
+    when: exportpolicy != None
+
   - name: Create Export Policy Rules
     na_ontap_export_policy_rule:
       state: present
       allow_suid: true
-      client_match: "{{ item.client_match }}"
+      client_match: "{{ item.client_match }} "
       policy_name: "{{ item.name }}"
+      rule_index: "{{item.rule_index}}"
       protocol: "nfs"
-      ro_rule: "any"
-      rw_rule: "any"
-      super_user_security: "any"
+      ro_rule: "sys"
+      rw_rule: "sys"
+      super_user_security: "sys"
       vserver: "{{ item.vserver }}"
       <<: *login
     with_items:
@@ -345,36 +375,44 @@
       state: present
       name: "{{ item.name }}"
       initiator_group_type: "{{ item.initiator_group_type }}"
+      initiator_names: "{{item.iqn | default(omit)}}"
       os_type: "{{ item.os_type }}"
-      initiator_names: "{{ item.initiator_names }}"
       vserver: "{{ item.vserver }}"
       <<: *login
     with_items:
       "{{ igroup }}"
     when: igroup != None
-    tags:
-      - igroup
+
 
   - name: Create Flexvol Volumes
     na_ontap_volume:
       state: present
       name: "{{ item.name }}"
-      junction_path: "{{ item.junction_path }}"
+      junction_path: "{{ item.junction_path | default(omit) }}"
       is_infinite: False
       aggregate_name: "{{ item.aggr }}"
       snapshot_policy: "{{ item.snapshot_policy }}"
       size: "{{ item.size }}"
       size_unit: gb
       space_guarantee: none
-      policy: "{{ item.policy }}"
+      snapshot_auto_delete:
+        state: "on"
+        commitment: try
+        defer_delete: user_created
+        delete_order: oldest_first
+        target_free_space: 10
+      snapdir_access: false
+      policy: "{{ item.policy | default(omit) }}"
       percent_snapshot_space: "{{ item.snappercent }}"
       vserver: "{{ item.vserver }}"
       volume_security_style: "{{ item.securitystyle }}"
-      wait_for_completion: false
+      wait_for_completion: true
       <<: *login
     with_items:
       "{{ volumes }}"
     when: (volumes != None)
+    
+
 
   - name: Create Flexgroup Volumes
     na_ontap_volume:
@@ -392,11 +430,12 @@
       percent_snapshot_space: "{{ item.snappercent }}"
       vserver: "{{ item.vserver }}"
       volume_security_style: "{{ item.securitystyle }}"
-      wait_for_completion: false
+      wait_for_completion: true
       <<: *login
     with_items:
       "{{ FGvolumes }}"
     when: (FGvolumes != None)
+  
 
   - name: Create Luns
     na_ontap_lun:
@@ -414,6 +453,7 @@
       "{{ luns }}"
     when: (luns != None)
 
+
   - name: Create LUN mapping
     na_ontap_lun_map:
       state: present
@@ -430,7 +470,10 @@
     na_ontap_volume_efficiency:
       state: present
       vserver: "{{ item.vserver }}"
-      path: "/vol{{ item.junction_path }}"
+      path: "/vol/{{ item.name }}"
+      enable_compression: yes
+      enable_inline_compression: yes
+      enable_data_compaction: yes
       <<: *login
     with_items:
       "{{ volumes }}"
@@ -446,11 +489,51 @@
       "{{ FGvolumes }}"
     when: (FGvolumes != None) and (item.sis_enable == true)
 
-  - name: Create SNMP community
-    na_ontap_snmp:
-      community_name: "{{ item.community_name }}"
-      access_control: "{{ item.access_control }}"
+  - name: SNMP Config
+    na_ontap_user:
+      state: present
+      name: "{{ item.username }}"
+      application_dicts:
+        - application: snmp
+          authentication_methods:
+          - usm
+          - community
+      privacy_protocol: "{{ item.privacy_protocol}}"
+      authentication_protocol: "{{ item.authentication_protocol}}"
+      authentication_password: "{{ item.authentication_password}}"
+      privacy_password: "{{ item.privacy_password}}" 
+      role_name: "{{ item.role }}"
+      vserver: "{{ item.vserver }}"
       <<: *login
     with_items:
       "{{ snmp }}"
     when: snmp != None
+
+  - name: Enable LLDP
+    na_ontap_command:
+      command: ["run -node * -command options lldp.enable on"]
+      <<: *login
+
+
+  - name: Enable v3-ms-dos-client on NFS SVM
+    netapp.ontap.na_ontap_ssh_command:
+      command: vserver nfs modify -vserver "{{ item.vserver }}" -v3-ms-dos-client enabled ##need pormiko
+      accept_unknown_host_keys: true 
+      https: true
+      privilege: admin
+      <<: *login
+    with_items:
+      "{{ nfs }}"
+    when: nfs != None
+
+  - name: Enable access NFS exports from Windows nfs-agents
+    netapp.ontap.na_ontap_ssh_command:
+      command: vserver nfs modify -vserver "{{ item.vserver }}" -enable-ejukebox false -v3-connection-drop disabled -v3-64bit-identifiers enable ##need pormiko
+      https: true
+      accept_unknown_host_keys: true 
+      privilege: diagnostic
+      <<: *login
+    with_items:
+      "{{ nfs }}"
+    when: nfs != None
+
